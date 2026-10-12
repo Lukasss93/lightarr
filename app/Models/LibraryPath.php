@@ -1,0 +1,47 @@
+<?php
+
+namespace App\Models;
+
+use App\Scan\Enums\ScanStatus;
+use Carbon\CarbonImmutable;
+use Database\Factories\LibraryPathFactory;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+/**
+ * @property ScanStatus $scan_status
+ * @property CarbonImmutable|null $last_successful_scan_at
+ */
+#[Fillable(['library_id', 'path', 'path_hash', 'scan_status', 'scan_token', 'scan_requested_at', 'scan_started_at', 'scan_finished_at', 'last_successful_scan_at', 'scan_error'])]
+class LibraryPath extends Model
+{
+    /** @use HasFactory<LibraryPathFactory> */
+    use HasFactory;
+
+    /** @return BelongsTo<Library, $this> */
+    public function library(): BelongsTo
+    {
+        return $this->belongsTo(Library::class);
+    }
+
+    /** @return HasMany<MediaFile, $this> */
+    public function mediaFiles(): HasMany
+    {
+        return $this->hasMany(MediaFile::class);
+    }
+
+    /** @return array<string, string> */
+    protected function casts(): array
+    {
+        return [
+            'scan_status' => ScanStatus::class,
+            'scan_requested_at' => 'immutable_datetime',
+            'scan_started_at' => 'immutable_datetime',
+            'scan_finished_at' => 'immutable_datetime',
+            'last_successful_scan_at' => 'immutable_datetime',
+        ];
+    }
+}

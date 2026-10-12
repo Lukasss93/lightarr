@@ -1,0 +1,303 @@
+<?php
+
+use App\Jobs\ScanLibraryPath;
+use App\Livewire\Settings\Libraries;
+use App\Models\Library;
+use App\Models\LibraryPath;
+use App\Models\MediaFile;
+use App\Models\User;
+use App\Scan\DirectoryBrowser;
+use App\Scan\LibraryPathResolver;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Config;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Queue;
+use Illuminate\Validation\ValidationException;
+use Livewire\Livewire;
+
+use function Pest\Laravel\actingAs;
+use function Pest\Laravel\assertDatabaseCount;
+use function Pest\Laravel\assertDatabaseHas;
+use function Pest\Laravel\assertDatabaseMissing;
+use function Pest\Laravel\get;
+use function Pest\Laravel\postJson;
+
+it('requires authentication for library management', function (): void {
+    get(route('settings.libraries'))->assertRedirectToRoute('login');
+});
+
+it('creates a shared library with multiple roots and queues their initial scans', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    actingAs(User::factory()->create());
+    $first = mediaDirectory();
+    $second = mediaDirectory();
+
+    Livewire::test(Libraries::class)->call('create')
+        ->set('name', 'Movies')->set('paths', [$first, $second])
+        ->set('interval', '2')->set('intervalUnit', 'hours')
+        ->set('exclusions', "Extras\n*sample*\n\nExtras")
+        ->call('save')->assertHasNoErrors()->assertSet('showEditor', false);
+
+    $library = Library::query()->firstOrFail();
+    expect($library->scan_interval_minutes)->toBe(120)
+        ->and($library->exclusion_patterns)->toBe(['Extras', '*sample*'])
+        ->and($library->paths()->count())->toBe(2)
+        ->and($library->last_scan_requested_at)->not->toBeNull();
+    Queue::assertPushed(ScanLibraryPath::class, 2);
+    assertDatabaseHas('library_paths', ['path' => $first, 'path_hash' => hash('sha256', $first), 'scan_status' => 'queued']);
+    actingAs(User::factory()->create())->get(route('settings.libraries'))->assertOk()->assertSee('Movies');
+});
+
+it('accepts custom intervals in each supported unit', function (string $value, string $unit, int $minutes): void {
+    Queue::fake([ScanLibraryPath::class]);
+
+    Livewire::test(Libraries::class)->set('name', 'Videos')->set('paths', [mediaDirectory()])
+        ->set('interval', $value)->set('intervalUnit', $unit)->call('save')->assertHasNoErrors();
+
+    expect(Library::query()->firstOrFail()->scan_interval_minutes)->toBe($minutes);
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+})->with([
+    'minimum' => ['1', 'minutes', 1],
+    'custom minutes' => ['37', 'minutes', 37],
+    'hours' => ['3', 'hours', 180],
+    'days' => ['2', 'days', 2880],
+]);
+
+it('rejects invalid library inputs', function (string $field, mixed $value, string $error): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $component = Livewire::test(Libraries::class)->set('name', 'Videos')->set('paths', [mediaDirectory()]);
+    $component->set($field, $value)->call('save')->assertHasErrors([$error]);
+
+    assertDatabaseCount('libraries', 0);
+    Queue::assertNothingPushed();
+})->with([
+    'blank name' => ['name', '', 'name'],
+    'no roots' => ['paths', [], 'paths'],
+    'relative root' => ['paths', ['relative/path'], 'paths.0'],
+    'nonexistent root' => ['paths', ['/folder-that-does-not-exist-rencoderr'], 'paths.0'],
+    'zero interval' => ['interval', '0', 'interval'],
+    'fractional interval' => ['interval', '1.5', 'interval'],
+    'invalid unit' => ['intervalUnit', 'seconds', 'intervalUnit'],
+    'overflow interval' => ['interval', '2147483648', 'interval'],
+]);
+
+it('rejects duplicate canonical roots even through symbolic aliases', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $directory = mediaDirectory();
+    $aliases = mediaDirectory();
+    symlink($directory, $aliases.'/alias');
+
+    Livewire::test(Libraries::class)->set('name', 'Videos')
+        ->set('paths', [$directory.'/', $aliases.'/alias'])->call('save')->assertHasErrors(['paths.1']);
+
+    assertDatabaseCount('libraries', 0);
+    Queue::assertNothingPushed();
+});
+
+it('rejects root overlaps across libraries in either direction', function (bool $parentAlreadyConfigured): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $directory = mediaDirectory();
+    File::ensureDirectoryExists($directory.'/movies');
+    $existing = $parentAlreadyConfigured ? $directory : $directory.'/movies';
+    $proposed = $parentAlreadyConfigured ? $directory.'/movies' : $directory;
+    LibraryPath::factory()->atPath($existing)->create();
+
+    Livewire::test(Libraries::class)->set('name', 'Other videos')->set('paths', [$proposed])
+        ->call('save')->assertHasErrors(['paths.0']);
+
+    assertDatabaseCount('libraries', 1);
+    Queue::assertNothingPushed();
+})->with([true, false]);
+
+it('accepts sibling roots with similar prefixes', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $directory = mediaDirectory();
+    File::ensureDirectoryExists($directory.'/media');
+    File::ensureDirectoryExists($directory.'/media-old');
+    LibraryPath::factory()->atPath($directory.'/media')->create();
+
+    Livewire::test(Libraries::class)->set('name', 'Other videos')->set('paths', [$directory.'/media-old'])
+        ->call('save')->assertHasNoErrors();
+
+    assertDatabaseCount('library_paths', 2);
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+});
+
+it('edits settings while retaining an unavailable root and its inventory', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $library = Library::factory()->create(['scan_interval_minutes' => 120]);
+    $root = LibraryPath::factory()->for($library)->atPath(mediaDirectory())->create();
+    $file = MediaFile::factory()->for($root, 'libraryPath')->create();
+    File::deleteDirectory($root->path);
+
+    Livewire::test(Libraries::class)->call('edit', $library->id)
+        ->assertSet('interval', '2')->assertSet('intervalUnit', 'hours')
+        ->set('name', 'Updated videos')->set('automaticScanning', false)->call('save')->assertHasNoErrors();
+
+    expect($library->refresh()->name)->toBe('Updated videos')->and($library->automatic_scanning)->toBeFalse();
+    assertDatabaseHas('media_files', ['id' => $file->id]);
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+});
+
+it('removes a folder inventory on save and leaves source media unchanged', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $library = Library::factory()->create();
+    $first = LibraryPath::factory()->for($library)->atPath(mediaDirectory(['movie.mkv' => 'video']))->create();
+    $second = LibraryPath::factory()->for($library)->atPath(mediaDirectory())->create();
+    $file = MediaFile::factory()->for($first, 'libraryPath')->create();
+
+    Livewire::test(Libraries::class)->call('edit', $library->id)->call('removePath', 0)->call('save')->assertHasNoErrors();
+
+    assertDatabaseMissing('library_paths', ['id' => $first->id]);
+    assertDatabaseMissing('media_files', ['id' => $file->id]);
+    assertDatabaseHas('library_paths', ['id' => $second->id]);
+    expect(File::get($first->path.'/movie.mkv'))->toBe('video');
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+});
+
+it('removes a library and its records without deleting source files', function (): void {
+    $library = Library::factory()->create();
+    $root = LibraryPath::factory()->for($library)->atPath(mediaDirectory(['movie.mkv' => 'video']))->create();
+    MediaFile::factory()->for($root, 'libraryPath')->create();
+
+    Livewire::test(Libraries::class)->call('delete', $library->id);
+
+    assertDatabaseCount('libraries', 0);
+    assertDatabaseCount('library_paths', 0);
+    assertDatabaseCount('media_files', 0);
+    expect(File::get($root->path.'/movie.mkv'))->toBe('video');
+});
+
+it('lists only directories with breadcrumbs and paginated navigation', function (): void {
+    $directory = mediaDirectory(['video.mkv' => 'video']);
+
+    for ($index = 0; $index < 51; $index++) {
+        File::ensureDirectoryExists($directory.'/folder-'.$index);
+    }
+
+    $browser = app(DirectoryBrowser::class);
+    $first = $browser->browse($directory);
+    $second = $browser->browse($directory, 2);
+
+    expect($first['total'])->toBe(51)->and($first['directories'])->toHaveCount(50)
+        ->and($second['directories'])->toHaveCount(1)
+        ->and($first['parent'])->toBe(dirname($directory))
+        ->and($first['breadcrumbs'][0])->toBe(['name' => '/', 'path' => '/']);
+});
+
+it('navigates and selects server folders while preserving the last valid location on error', function (): void {
+    $directory = mediaDirectory();
+    File::ensureDirectoryExists($directory.'/movies');
+
+    Livewire::test(Libraries::class)->call('create')->call('browse')
+        ->set('browserPath', $directory.'/movies')->call('navigate')
+        ->assertSet('currentDirectory', $directory.'/movies')
+        ->assertSee('Parent folder')->set('browserPath', '/folder-that-does-not-exist-rencoderr')->call('navigate')
+        ->assertHasErrors(['browserPath'])->assertSet('currentDirectory', $directory.'/movies')
+        ->call('selectDirectory')->assertSet('paths', [$directory.'/movies'])->assertSet('showBrowser', false);
+});
+
+it('rejects selecting a directory that disappeared after navigation', function (): void {
+    $directory = mediaDirectory();
+    $component = Livewire::test(Libraries::class)->call('create')->call('browse')->call('navigate', $directory);
+    File::deleteDirectory($directory);
+
+    $component->call('selectDirectory')->assertHasErrors(['browserPath'])->assertSet('paths', []);
+});
+
+it('renders working folder navigation arguments for paths containing special characters', function (): void {
+    $parent = mediaDirectory();
+    $name = "Films ' \" & < > 日本語 \\";
+    $directory = $parent.'/'.$name;
+    $childName = "00 ' \" & < > 日本語 \\";
+    File::ensureDirectoryExists($directory.'/'.$childName);
+
+    for ($index = 0; $index < 50; $index++) {
+        File::ensureDirectoryExists($directory.'/folder-'.$index);
+    }
+
+    $component = Livewire::test(Libraries::class)->call('create')->call('browse')->call('navigate', $directory);
+    $document = new DOMDocument;
+    $document->loadHTML('<meta charset="utf-8">'.$component->html(), LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_NONET);
+    $actions = [];
+
+    foreach ($document->getElementsByTagName('button') as $button) {
+        $expression = $button->getAttribute('wire:click');
+
+        if (! str_starts_with($expression, 'navigate(')) {
+            continue;
+        }
+
+        $arguments = substr($expression, strlen('navigate('), -1);
+        $actions[trim($button->textContent)] = json_decode('['.$arguments.']', true, flags: JSON_THROW_ON_ERROR);
+    }
+
+    expect($actions)->toHaveKeys([$name, $childName, 'Parent folder', 'Previous', 'Next']);
+    expect($actions[$name])->toBe([$directory]);
+    expect($actions[$childName])->toBe([$directory.'/'.$childName]);
+    expect($actions['Parent folder'])->toBe([$parent]);
+    expect($actions['Previous'])->toBe([$directory, 0]);
+    expect($actions['Next'])->toBe([$directory, 2]);
+});
+
+it('validates manually added paths at save rather than trusting the selection list', function (): void {
+    Livewire::test(Libraries::class)->call('create')->set('name', 'Videos')->set('newPath', 'relative-path')
+        ->call('addPath')->assertSet('paths', ['relative-path'])
+        ->call('save')->assertHasErrors(['paths.0']);
+    assertDatabaseCount('libraries', 0);
+});
+
+it('allows library creation through a guest Livewire request when authentication is disabled', function (): void {
+    Config::set('auth.enabled', false);
+    Queue::fake([ScanLibraryPath::class]);
+    $page = get(route('settings.libraries'))->assertOk();
+
+    postJson(Livewire::getUpdateUri(), livewireUpdatePayload($page, [
+        'name' => 'Local videos', 'paths' => [mediaDirectory()],
+    ], [['method' => 'save', 'params' => []]]), ['X-Livewire' => 'true'])->assertOk();
+
+    assertDatabaseHas('libraries', ['name' => 'Local videos']);
+    assertDatabaseCount('users', 0);
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+});
+
+it('rejects a library mutation after the authenticated session expires', function (): void {
+    $library = Library::factory()->create();
+    Auth::login(User::factory()->create());
+    $page = get(route('settings.libraries'))->assertOk();
+    Auth::logout();
+    session()->invalidate();
+    Auth::forgetGuards();
+
+    postJson(Livewire::getUpdateUri(), livewireUpdatePayload($page, [], [
+        ['method' => 'delete', 'params' => [$library->id]],
+    ]), ['X-Livewire' => 'true'])->assertUnauthorized();
+
+    assertDatabaseHas('libraries', ['id' => $library->id]);
+});
+
+it('rejects non-directory and non-absolute folder selections', function (): void {
+    $directory = mediaDirectory(['movie.mkv' => 'video']);
+
+    expect(fn () => app(LibraryPathResolver::class)->canonical($directory.'/movie.mkv'))->toThrow(ValidationException::class)
+        ->and(fn () => app(LibraryPathResolver::class)->canonical('relative-path'))->toThrow(ValidationException::class);
+});
+
+it('rejects unreadable folders and hides them from the folder picker', function (): void {
+    $directory = mediaDirectory();
+    File::ensureDirectoryExists($directory.'/restricted');
+    chmod($directory.'/restricted', 0000);
+
+    try {
+        expect(fn () => app(LibraryPathResolver::class)->canonical($directory.'/restricted'))->toThrow(ValidationException::class);
+        expect(app(DirectoryBrowser::class)->browse($directory)['directories'])->toBe([]);
+    } finally {
+        chmod($directory.'/restricted', 0755);
+    }
+});
+
+it('rejects interval conversion that exceeds the stored minute range', function (): void {
+    Livewire::test(Libraries::class)->set('name', 'Videos')->set('paths', [mediaDirectory()])
+        ->set('interval', '2147483647')->set('intervalUnit', 'days')->call('save')->assertHasErrors(['interval']);
+    assertDatabaseCount('libraries', 0);
+});
