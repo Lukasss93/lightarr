@@ -64,7 +64,7 @@ it('updates metadata without duplicates and preserves the first discovery', func
 });
 
 it('retains missing files and restores them when they return', function (): void {
-    $directory = mediaDirectory(['movie.mkv' => 'video']);
+    $directory = mediaDirectory(['movie.mkv' => 'video', 'movie.srt' => 'subtitles']);
     $root = LibraryPath::factory()->atPath($directory)->create();
     scanMediaPath($root);
     $file = $root->mediaFiles()->firstOrFail();
@@ -158,6 +158,30 @@ it('preserves availability when a configured root becomes inaccessible', functio
         ->and($root->mediaFiles()->firstOrFail()->status)->toBe(MediaFileStatus::Present);
 });
 
+it('treats an emptied folder with known videos as unavailable, such as an unmounted network share', function (): void {
+    $directory = mediaDirectory(['movie.mkv' => 'video']);
+    $root = LibraryPath::factory()->atPath($directory)->create();
+    scanMediaPath($root);
+    File::delete($directory.'/movie.mkv');
+
+    expect(fn () => scanMediaPath($root))->toThrow(RuntimeException::class, 'check that it is mounted');
+
+    expect($root->refresh()->scan_status)->toBe(ScanStatus::Failed)
+        ->and($root->scan_error)->toContain('check that it is mounted')
+        ->and($root->mediaFiles()->firstOrFail()->status)->toBe(MediaFileStatus::Present);
+});
+
+it('completes scans of empty folders without known present videos', function (): void {
+    $directory = mediaDirectory();
+    $root = LibraryPath::factory()->atPath($directory)->create();
+    $missing = MediaFile::factory()->for($root, 'libraryPath')->missing()->create();
+
+    scanMediaPath($root);
+
+    expect($root->refresh()->scan_status)->toBe(ScanStatus::Completed)
+        ->and($missing->refresh()->status)->toBe(MediaFileStatus::Missing);
+});
+
 it('preserves unseen availability after a partial traversal while keeping completed batches', function (): void {
     $directory = mediaDirectory(['observed.mkv' => 'observed']);
     $root = LibraryPath::factory()->atPath($directory)->create();
@@ -177,7 +201,9 @@ it('preserves unseen availability after a partial traversal while keeping comple
         }
     };
 
-    expect(fn () => (new ScanLibraryPath($root->id, $token, []))->handle($scanner))
+    app()->instance(MediaScanner::class, $scanner);
+
+    expect(fn () => ScanLibraryPath::dispatchSync($root->id, $token))
         ->toThrow(RuntimeException::class, 'Storage became unavailable.');
 
     expect($root->refresh()->scan_status)->toBe(ScanStatus::Failed)

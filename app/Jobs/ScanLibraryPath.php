@@ -5,35 +5,32 @@ namespace App\Jobs;
 use App\Models\LibraryPath;
 use App\Scan\Enums\ScanStatus;
 use App\Scan\MediaScanner;
-use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
-use Illuminate\Queue\Middleware\WithoutOverlapping;
 use Throwable;
 
-class ScanLibraryPath implements ShouldBeUnique, ShouldQueue
+/**
+ * Scans one library folder for the scan request identified by the token.
+ *
+ * A job whose token no longer matches the folder belongs to an older request and does nothing.
+ */
+class ScanLibraryPath implements ShouldQueue
 {
     use Queueable;
 
-    public int $timeout = 1800;
+    /**
+     * The worker stops a scan after this many seconds, so a scan that has made no progress
+     * for longer than this is treated as lost and the folder can be queued again.
+     */
+    public const int TIMEOUT_SECONDS = 1800;
+
+    public int $timeout = self::TIMEOUT_SECONDS;
 
     public int $tries = 1;
 
     public bool $failOnTimeout = true;
 
-    /** @param list<string> $exclusions */
-    public function __construct(public int $pathId, public string $token, public array $exclusions) {}
-
-    public function uniqueId(): string
-    {
-        return (string) $this->pathId;
-    }
-
-    /** @return list<WithoutOverlapping> */
-    public function middleware(): array
-    {
-        return [(new WithoutOverlapping('library-path:'.$this->pathId))->dontRelease()->expireAfter(1860)];
-    }
+    public function __construct(public int $pathId, public string $token) {}
 
     public function handle(MediaScanner $scanner): void
     {
@@ -42,16 +39,8 @@ class ScanLibraryPath implements ShouldBeUnique, ShouldQueue
             ->where('scan_status', ScanStatus::Queued)
             ->update(['scan_status' => ScanStatus::Scanning, 'scan_started_at' => now()]);
 
-        if ($claimed === 0) {
-            return;
-        }
-
-        try {
-            $scanner->scan($this->pathId, $this->token, $this->exclusions);
-        } catch (Throwable $exception) {
-            $this->failed($exception);
-
-            throw $exception;
+        if ($claimed === 1) {
+            $scanner->scan($this->pathId, $this->token);
         }
     }
 

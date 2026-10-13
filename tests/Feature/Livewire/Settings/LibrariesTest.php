@@ -7,11 +7,14 @@ use App\Models\LibraryPath;
 use App\Models\MediaFile;
 use App\Models\User;
 use App\Scan\DirectoryBrowser;
+use App\Scan\Enums\ScanStatus;
 use App\Scan\LibraryPathResolver;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Sleep;
 use Illuminate\Validation\ValidationException;
 use Livewire\Livewire;
 
@@ -19,6 +22,7 @@ use function Pest\Laravel\actingAs;
 use function Pest\Laravel\assertDatabaseCount;
 use function Pest\Laravel\assertDatabaseHas;
 use function Pest\Laravel\assertDatabaseMissing;
+use function Pest\Laravel\freezeTime;
 use function Pest\Laravel\get;
 use function Pest\Laravel\postJson;
 
@@ -81,6 +85,18 @@ it('rejects invalid library inputs', function (string $field, mixed $value, stri
     'overflow interval' => ['interval', '2147483648', 'interval'],
 ]);
 
+it('asks to try again when another library save is still in progress', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    Sleep::fake(syncWithCarbon: true);
+    Cache::lock('library-path-management', 30)->get();
+
+    Livewire::test(Libraries::class)->set('name', 'Videos')->set('paths', [mediaDirectory()])
+        ->call('save')->assertHasErrors(['paths' => 'Another library is being saved. Try again in a moment.']);
+
+    assertDatabaseCount('libraries', 0);
+    Queue::assertNothingPushed();
+});
+
 it('rejects duplicate canonical roots even through symbolic aliases', function (): void {
     Queue::fake([ScanLibraryPath::class]);
     $directory = mediaDirectory();
@@ -139,6 +155,35 @@ it('edits settings while retaining an unavailable root and its inventory', funct
     Queue::assertPushed(ScanLibraryPath::class, 1);
 });
 
+it('scans an added folder without delaying the automatic scan of existing folders', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    freezeTime();
+    $library = Library::factory()->create(['last_scan_requested_at' => now()->subMinutes(10)]);
+    $existing = LibraryPath::factory()->for($library)->atPath(mediaDirectory())->create(['scan_status' => ScanStatus::Completed]);
+    $added = mediaDirectory();
+
+    Livewire::test(Libraries::class)->call('edit', $library->id)->set('newPath', $added)->call('save')->assertHasNoErrors();
+
+    Queue::assertPushed(ScanLibraryPath::class, 1);
+    Queue::assertPushed(ScanLibraryPath::class, fn (ScanLibraryPath $job): bool => $job->pathId !== $existing->id);
+    expect($library->refresh()->last_scan_requested_at?->toDateTimeString())->toBe(now()->subMinutes(10)->toDateTimeString());
+});
+
+it('rescans every folder when the exclusion patterns change', function (string $exclusions, int $scans): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $library = Library::factory()->create(['exclusion_patterns' => ['Extras']]);
+    LibraryPath::factory()->for($library)->atPath(mediaDirectory())->create(['scan_status' => ScanStatus::Completed]);
+    LibraryPath::factory()->for($library)->atPath(mediaDirectory())->create(['scan_status' => ScanStatus::Completed]);
+
+    Livewire::test(Libraries::class)->call('edit', $library->id)
+        ->set('name', 'Renamed')->set('exclusions', $exclusions)->call('save')->assertHasNoErrors();
+
+    Queue::assertPushed(ScanLibraryPath::class, $scans);
+})->with([
+    'patterns changed' => ["Extras\n*sample*", 2],
+    'patterns unchanged' => ['Extras', 0],
+]);
+
 it('removes a folder inventory on save and leaves source media unchanged', function (): void {
     Queue::fake([ScanLibraryPath::class]);
     $library = Library::factory()->create();
@@ -191,10 +236,21 @@ it('navigates and selects server folders while preserving the last valid locatio
 
     Livewire::test(Libraries::class)->call('create')->call('browse')
         ->set('browserPath', $directory.'/movies')->call('navigate')
-        ->assertSet('currentDirectory', $directory.'/movies')
+        ->assertSet('listing.path', $directory.'/movies')
         ->assertSee('Parent folder')->set('browserPath', '/folder-that-does-not-exist-rencoderr')->call('navigate')
-        ->assertHasErrors(['browserPath'])->assertSet('currentDirectory', $directory.'/movies')
+        ->assertHasErrors(['browserPath'])->assertSet('listing.path', $directory.'/movies')
         ->call('selectDirectory')->assertSet('paths', [$directory.'/movies'])->assertSet('showBrowser', false);
+});
+
+it('reads a browsed folder from disk only when navigating, not on every refresh', function (): void {
+    $directory = mediaDirectory();
+    File::ensureDirectoryExists($directory.'/movies');
+    $browser = Mockery::mock(DirectoryBrowser::class, [app(LibraryPathResolver::class)])->makePartial();
+    $browser->shouldReceive('browse')->twice()->passthru();
+    app()->instance(DirectoryBrowser::class, $browser);
+
+    Livewire::test(Libraries::class)->call('create')->call('browse')->call('navigate', $directory)
+        ->call('$refresh')->call('$refresh')->assertSee('movies')->assertSet('listing.path', $directory);
 });
 
 it('rejects selecting a directory that disappeared after navigation', function (): void {

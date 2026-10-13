@@ -32,11 +32,11 @@ it('shows real waiting processing and scheduled job counts with the latest scan 
         'scan_status' => ScanStatus::Failed, 'scan_requested_at' => now(), 'scan_error' => 'Storage unavailable.',
     ]);
     LibraryPath::factory()->for($library)->atPath('/media/not-scanned')->create();
-    JobQueue::push(new ScanLibraryPath($running->id, (string) Str::uuid(), []));
+    JobQueue::push(new ScanLibraryPath($running->id, (string) Str::uuid()));
     expect(JobQueue::pop())->not->toBeNull();
-    JobQueue::push(new ScanLibraryPath($waiting->id, (string) Str::uuid(), []));
-    JobQueue::later(now()->addMinutes(10), new ScanLibraryPath($waiting->id, (string) Str::uuid(), []));
-    JobQueue::pushOn('other-queue', new ScanLibraryPath($waiting->id, (string) Str::uuid(), []));
+    JobQueue::push(new ScanLibraryPath($waiting->id, (string) Str::uuid()));
+    JobQueue::later(now()->addMinutes(10), new ScanLibraryPath($waiting->id, (string) Str::uuid()));
+    JobQueue::pushOn('other-queue', new ScanLibraryPath($waiting->id, (string) Str::uuid()));
 
     Livewire::test(Queue::class)->assertViewHas('statistics', [
         'waiting' => 1, 'processing' => 1, 'delayed' => 1, 'failed' => 1,
@@ -48,7 +48,7 @@ it('shows real waiting processing and scheduled job counts with the latest scan 
 it('refreshes queue counts and scan results after work finishes', function (): void {
     Config::set('queue.default', 'database');
     $root = LibraryPath::factory()->create(['scan_status' => ScanStatus::Scanning, 'scan_requested_at' => now()]);
-    JobQueue::push(new ScanLibraryPath($root->id, (string) Str::uuid(), []));
+    JobQueue::push(new ScanLibraryPath($root->id, (string) Str::uuid()));
     $job = JobQueue::pop();
 
     if ($job === null) {

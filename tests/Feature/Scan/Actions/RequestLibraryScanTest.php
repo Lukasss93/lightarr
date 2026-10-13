@@ -10,7 +10,6 @@ use App\Scan\Enums\MediaFileStatus;
 use App\Scan\Enums\ScanStatus;
 use App\Scan\MediaScanner;
 use Illuminate\Contracts\Bus\Dispatcher;
-use Illuminate\Contracts\Cache\Repository;
 use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Exceptions;
@@ -42,28 +41,100 @@ it('queues only due automatic libraries at the exact interval boundary', functio
 
 it('allows manual scans of disabled libraries and deduplicates repeated requests', function (): void {
     Queue::fake([ScanLibraryPath::class]);
-    $library = Library::factory()->manual()->create(['exclusion_patterns' => ['Extras']]);
+    $library = Library::factory()->manual()->create();
     $root = LibraryPath::factory()->for($library)->create();
 
     Livewire::test(Libraries::class)->call('scan', $library->id)->assertSee('Queued 1 folder scans.')
         ->call('scan', $library->id)->assertSee('already queued or scanning');
 
     Queue::assertPushed(ScanLibraryPath::class, 1);
-    Queue::assertPushed(ScanLibraryPath::class, fn (ScanLibraryPath $job): bool => $job->exclusions === ['Extras']);
     expect($root->refresh()->scan_status)->toBe(ScanStatus::Queued);
 });
 
 it('skips active roots while allowing other roots of the library to be requested', function (): void {
     Queue::fake([ScanLibraryPath::class]);
     $library = Library::factory()->create();
-    LibraryPath::factory()->for($library)->create(['scan_status' => ScanStatus::Scanning]);
-    LibraryPath::factory()->for($library)->create(['scan_status' => ScanStatus::Queued]);
+    LibraryPath::factory()->for($library)->create(['scan_status' => ScanStatus::Scanning, 'scan_requested_at' => now(), 'scan_started_at' => now()]);
+    LibraryPath::factory()->for($library)->create(['scan_status' => ScanStatus::Queued, 'scan_requested_at' => now()]);
     $inactive = LibraryPath::factory()->for($library)->create(['scan_status' => ScanStatus::Failed]);
 
     expect(app(RequestLibraryScan::class)->handle($library))->toBe(1);
 
     Queue::assertPushed(ScanLibraryPath::class, 1);
     Queue::assertPushed(ScanLibraryPath::class, fn (ScanLibraryPath $job): bool => $job->pathId === $inactive->id);
+});
+
+it('queues a lost queued scan again once the scan timeout passes, keeping its token', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    freezeTime();
+    $token = (string) Str::uuid();
+    $library = Library::factory()->create();
+    $root = LibraryPath::factory()->for($library)->create([
+        'scan_status' => ScanStatus::Queued, 'scan_token' => $token,
+        'scan_requested_at' => now()->subSeconds(ScanLibraryPath::TIMEOUT_SECONDS - 1),
+    ]);
+
+    expect(app(RequestLibraryScan::class)->handle($library))->toBe(0);
+    travel(1)->second();
+    expect(app(RequestLibraryScan::class)->handle($library))->toBe(1);
+
+    Queue::assertPushed(ScanLibraryPath::class, fn (ScanLibraryPath $job): bool => $job->token === $token);
+    expect($root->refresh()->scan_status)->toBe(ScanStatus::Queued)
+        ->and($root->scan_requested_at?->toDateTimeString())->toBe(now()->toDateTimeString());
+});
+
+it('runs only one of the original and replacement jobs for a requeued scan', function (): void {
+    $token = (string) Str::uuid();
+    $library = Library::factory()->create();
+    $root = LibraryPath::factory()->for($library)->atPath(mediaDirectory(['movie.mkv' => 'video']))->create([
+        'scan_status' => ScanStatus::Queued, 'scan_token' => $token, 'scan_requested_at' => now(),
+    ]);
+    $original = new ScanLibraryPath($root->id, $token);
+    $replacement = new ScanLibraryPath($root->id, $token);
+
+    $original->handle(app(MediaScanner::class));
+    $finishedAt = $root->refresh()->scan_finished_at?->toDateTimeString();
+    travel(1)->minute();
+    $replacement->handle(app(MediaScanner::class));
+
+    expect($root->refresh()->scan_status)->toBe(ScanStatus::Completed)
+        ->and($root->scan_finished_at?->toDateTimeString())->toBe($finishedAt);
+});
+
+it('replaces a scan whose worker stopped and ignores the stopped worker afterwards', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $staleToken = (string) Str::uuid();
+    $library = Library::factory()->create();
+    $root = LibraryPath::factory()->for($library)->create([
+        'scan_status' => ScanStatus::Scanning, 'scan_token' => $staleToken,
+        'scan_requested_at' => now()->subHours(2), 'scan_started_at' => now()->subSeconds(ScanLibraryPath::TIMEOUT_SECONDS),
+    ]);
+
+    expect(app(RequestLibraryScan::class)->handle($library))->toBe(1);
+    (new ScanLibraryPath($root->id, $staleToken))->failed(new RuntimeException('Worker was killed.'));
+
+    Queue::assertPushed(ScanLibraryPath::class, fn (ScanLibraryPath $job): bool => $job->token !== $staleToken);
+    expect($root->refresh()->scan_status)->toBe(ScanStatus::Queued)
+        ->and($root->scan_token)->not->toBe($staleToken)
+        ->and($root->scan_started_at)->toBeNull()
+        ->and($root->scan_error)->toBeNull();
+});
+
+it('leaves a folder to the request that changed it first', function (): void {
+    Queue::fake([ScanLibraryPath::class]);
+    $library = Library::factory()->create();
+    $root = LibraryPath::factory()->for($library)->create();
+    $winningToken = (string) Str::uuid();
+    LibraryPath::retrieved(function (LibraryPath $path) use ($winningToken): void {
+        LibraryPath::query()->whereKey($path->id)->update([
+            'scan_status' => ScanStatus::Queued, 'scan_token' => $winningToken, 'scan_requested_at' => now(),
+        ]);
+    });
+
+    expect(app(RequestLibraryScan::class)->handle($library))->toBe(0);
+
+    Queue::assertNothingPushed();
+    expect(DB::table('library_paths')->where('id', $root->id)->value('scan_token'))->toBe($winningToken);
 });
 
 it('does not dispatch work or retain claims when a transaction rolls back', function (): void {
@@ -106,7 +177,7 @@ it('records dispatch failures and permits a subsequent scan request', function (
         throw new LogicException('The queue double must implement the dispatcher contract.');
     }
     $bus->shouldReceive('dispatch')->once()->andThrow(new RuntimeException('Queue unavailable.'));
-    $dispatcher = new RequestLibraryScan($bus, app(Repository::class));
+    $dispatcher = new RequestLibraryScan($bus);
 
     $dispatcher->handle($library);
 
@@ -117,21 +188,7 @@ it('records dispatch failures and permits a subsequent scan request', function (
     Queue::assertPushed(ScanLibraryPath::class, 1);
 });
 
-it('does not leave an ignored unique dispatch stuck in queued state', function (): void {
-    Queue::fake([ScanLibraryPath::class]);
-    $library = Library::factory()->create();
-    $root = LibraryPath::factory()->for($library)->create();
-    app(RequestLibraryScan::class)->handle($library);
-    $root->refresh()->update(['scan_status' => ScanStatus::Completed]);
-
-    app(RequestLibraryScan::class)->handle($library);
-
-    Queue::assertPushed(ScanLibraryPath::class, 1);
-    expect($root->refresh()->scan_status)->toBe(ScanStatus::Failed)
-        ->and($root->scan_error)->toContain('Try again shortly');
-});
-
-it('processes a real database queue job and releases its uniqueness lock', function (): void {
+it('processes a real database queue job and accepts the next request once it completes', function (): void {
     Config::set('queue.default', 'database');
     $directory = mediaDirectory(['movie.mkv' => 'video']);
     $library = Library::factory()->create();
@@ -151,7 +208,7 @@ it('processes a real database queue job and releases its uniqueness lock', funct
 
 it('ignores stale jobs and stale failures instead of overwriting the current scan', function (): void {
     $root = LibraryPath::factory()->create(['scan_status' => ScanStatus::Queued, 'scan_token' => (string) Str::uuid()]);
-    $job = new ScanLibraryPath($root->id, (string) Str::uuid(), []);
+    $job = new ScanLibraryPath($root->id, (string) Str::uuid());
 
     $job->handle(app(MediaScanner::class));
     $job->failed(new RuntimeException('Old failure.'));
@@ -163,7 +220,7 @@ it('ignores stale jobs and stale failures instead of overwriting the current sca
 it('exits safely if a root was removed while its scan was queued', function (): void {
     $token = (string) Str::uuid();
     $root = LibraryPath::factory()->create(['scan_status' => ScanStatus::Queued, 'scan_token' => $token]);
-    $job = new ScanLibraryPath($root->id, $token, []);
+    $job = new ScanLibraryPath($root->id, $token);
     $root->delete();
 
     $job->handle(app(MediaScanner::class));
@@ -177,7 +234,7 @@ it('records a terminal timeout without changing known file availability', functi
     $root = LibraryPath::factory()->create(['scan_status' => ScanStatus::Scanning, 'scan_token' => $token]);
     $file = MediaFile::factory()->for($root, 'libraryPath')->create();
 
-    (new ScanLibraryPath($root->id, $token, []))->failed(new RuntimeException('Scan timed out.'));
+    (new ScanLibraryPath($root->id, $token))->failed(new RuntimeException('Scan timed out.'));
 
     expect($root->refresh()->scan_status)->toBe(ScanStatus::Failed)
         ->and($root->scan_error)->toBe('Scan timed out.')

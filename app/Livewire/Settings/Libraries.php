@@ -18,6 +18,9 @@ use Livewire\Component;
 #[Title('Library settings')]
 class Libraries extends Component
 {
+    /** @var array<string, int> Minutes in each scan interval unit, largest first. */
+    private const array MINUTES_PER_UNIT = ['days' => 1440, 'hours' => 60, 'minutes' => 1];
+
     public bool $showEditor = false;
 
     #[Locked]
@@ -42,11 +45,14 @@ class Libraries extends Component
 
     public string $browserPath = '/';
 
+    /**
+     * The folder shown in the folder browser. It is read from disk only when navigating,
+     * not on every render, because the page refreshes itself every few seconds.
+     *
+     * @var array{path: string, parent: ?string, breadcrumbs: list<array{name: string, path: string}>, directories: list<array{name: string, path: string}>, total: int, page: int, last_page: int}|null
+     */
     #[Locked]
-    public string $currentDirectory = '/';
-
-    #[Locked]
-    public int $browserPage = 1;
+    public ?array $listing = null;
 
     public string $notice = '';
 
@@ -59,7 +65,7 @@ class Libraries extends Component
 
     public function create(): void
     {
-        $this->reset('editingId', 'name', 'automaticScanning', 'interval', 'intervalUnit', 'exclusions', 'paths', 'newPath', 'showBrowser');
+        $this->reset('editingId', 'name', 'automaticScanning', 'interval', 'intervalUnit', 'exclusions', 'paths', 'newPath', 'showBrowser', 'listing');
         $this->resetValidation();
         $this->showEditor = true;
     }
@@ -72,12 +78,8 @@ class Libraries extends Component
         $this->name = $library->name;
         $this->automaticScanning = $library->automatic_scanning;
         $minutes = $library->scan_interval_minutes;
-        $this->intervalUnit = $minutes % 1440 === 0 ? 'days' : ($minutes % 60 === 0 ? 'hours' : 'minutes');
-        $this->interval = (string) ($minutes / match ($this->intervalUnit) {
-            'days' => 1440,
-            'hours' => 60,
-            default => 1,
-        });
+        $this->intervalUnit = (string) collect(self::MINUTES_PER_UNIT)->search(fn (int $unitMinutes): bool => $minutes % $unitMinutes === 0);
+        $this->interval = (string) intdiv($minutes, self::MINUTES_PER_UNIT[$this->intervalUnit]);
         $this->exclusions = implode("\n", $library->exclusion_patterns);
         $this->paths = array_values($library->paths->map(fn (LibraryPath $path): string => $path->path)->all());
     }
@@ -107,16 +109,12 @@ class Libraries extends Component
             'name' => ['required', 'string', 'max:255'],
             'automaticScanning' => ['boolean'],
             'interval' => ['required', 'integer', 'min:1', 'max:2147483647'],
-            'intervalUnit' => ['required', Rule::in(['minutes', 'hours', 'days'])],
+            'intervalUnit' => ['required', Rule::in(array_keys(self::MINUTES_PER_UNIT))],
             'exclusions' => ['string', 'max:16384'],
             'paths' => ['required', 'array', 'min:1'],
             'paths.*' => ['required', 'string', 'max:4096'],
         ]);
-        $minutes = (int) $this->interval * match ($this->intervalUnit) {
-            'days' => 1440,
-            'hours' => 60,
-            default => 1,
-        };
+        $minutes = (int) $this->interval * self::MINUTES_PER_UNIT[$this->intervalUnit];
 
         if ($minutes > 2147483647) {
             throw ValidationException::withMessages(['interval' => 'The scan interval is too large.']);
@@ -157,34 +155,21 @@ class Libraries extends Component
 
     public function navigate(?string $path = null, int $page = 1): void
     {
-        $listing = $this->browser->browse($path ?? $this->browserPath, $page);
-        $this->currentDirectory = $listing['path'];
-        $this->browserPath = $listing['path'];
-        $this->browserPage = $listing['page'];
+        $this->listing = $this->browser->browse($path ?? $this->browserPath, $page);
+        $this->browserPath = $this->listing['path'];
         $this->resetValidation('browserPath');
     }
 
     public function selectDirectory(LibraryPathResolver $paths): void
     {
-        $this->paths[] = $paths->canonical($this->currentDirectory, 'browserPath');
+        $this->paths[] = $paths->canonical($this->listing['path'] ?? '', 'browserPath');
         $this->showBrowser = false;
     }
 
     public function render(): View
     {
-        $listing = null;
-
-        if ($this->showBrowser) {
-            try {
-                $listing = $this->browser->browse($this->currentDirectory, $this->browserPage);
-            } catch (ValidationException $exception) {
-                $this->addError('browserPath', $exception->validator->errors()->first());
-            }
-        }
-
         return view('livewire.settings.libraries', [
             'libraries' => Library::query()->with('paths')->orderBy('name')->orderBy('id')->get(),
-            'listing' => $listing,
         ])->layoutData(['settingsPage' => true]);
     }
 }

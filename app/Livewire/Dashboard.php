@@ -7,6 +7,7 @@ use App\Models\MediaFile;
 use App\Scan\Enums\MediaFileStatus;
 use Illuminate\Contracts\View\View;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Number;
 use Livewire\Attributes\Title;
 use Livewire\Attributes\Url;
 use Livewire\Component;
@@ -35,17 +36,21 @@ class Dashboard extends Component
 
     public function render(): View
     {
-        $query = $this->inventory();
+        $totals = $this->inventory()->toBase()
+            ->selectRaw('status, count(*) as files, sum(size_bytes) as bytes')
+            ->groupBy('status')
+            ->get()
+            ->keyBy('status');
         $counts = [];
 
         foreach (MediaFileStatus::cases() as $status) {
-            $counts[$status->value] = (clone $query)->where('status', $status)->count();
+            $counts[$status->value] = (int) ($totals[$status->value]->files ?? 0);
         }
 
         return view('livewire.dashboard', [
-            'files' => (clone $query)->with('libraryPath.library')->orderBy('relative_path')->orderBy('id')->paginate(25),
+            'files' => $this->inventory()->with('libraryPath.library')->orderBy('relative_path')->orderBy('id')->paginate(25),
             'counts' => $counts,
-            'presentSize' => number_format((float) (clone $query)->where('status', MediaFileStatus::Present)->sum('size_bytes') / 1073741824, 2).' GiB',
+            'presentSize' => Number::fileSize((int) ($totals[MediaFileStatus::Present->value]->bytes ?? 0), maxPrecision: 2),
             'libraryOptions' => [
                 ['label' => 'All libraries', 'value' => ''],
                 ...Library::query()->orderBy('name')->orderBy('id')->get()
@@ -58,12 +63,25 @@ class Dashboard extends Component
         ]);
     }
 
-    /** @return Builder<MediaFile> */
+    /**
+     * The files matching the filters. Filter values come from the address bar, so values that
+     * are not a library ID or a known status are ignored.
+     *
+     * @return Builder<MediaFile>
+     */
     private function inventory(): Builder
     {
+        $status = MediaFileStatus::tryFrom($this->status);
+
         return MediaFile::query()
-            ->when($this->search !== '', fn (Builder $query) => $query->whereLike('relative_path', '%'.$this->search.'%'))
-            ->when($this->library !== '', fn (Builder $query) => $query->whereHas('libraryPath', fn (Builder $paths) => $paths->where('library_id', $this->library)))
-            ->when($this->status !== '', fn (Builder $query) => $query->where('status', $this->status));
+            ->when($this->search !== '', fn (Builder $query) => $query->whereRaw(
+                "relative_path like ? escape '!'",
+                ['%'.str_replace(['!', '%', '_'], ['!!', '!%', '!_'], $this->search).'%'],
+            ))
+            ->when(ctype_digit($this->library), fn (Builder $query) => $query->whereHas(
+                'libraryPath',
+                fn (Builder $paths) => $paths->where('library_id', (int) $this->library),
+            ))
+            ->when($status !== null, fn (Builder $query) => $query->where('status', $status));
     }
 }

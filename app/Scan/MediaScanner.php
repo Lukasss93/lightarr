@@ -11,6 +11,7 @@ use Generator;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\File;
 use RecursiveCallbackFilterIterator;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
@@ -21,8 +22,7 @@ class MediaScanner
 {
     public function __construct(private ExclusionMatcher $exclusions, private LibraryPathResolver $paths) {}
 
-    /** @param list<string> $patterns */
-    public function scan(int $pathId, string $token, array $patterns): void
+    public function scan(int $pathId, string $token): void
     {
         clearstatcache(true);
         $root = $this->currentRoot($pathId, $token)->first();
@@ -35,13 +35,21 @@ class MediaScanner
             throw new RuntimeException('The configured folder now resolves to a different location.');
         }
 
+        // A network share that is not mounted leaves an empty folder behind. Scanning it
+        // would mark every known video as missing, so treat it as unavailable instead.
+        if (File::isEmptyDirectory($root->path) && $root->mediaFiles()->where('status', MediaFileStatus::Present)->exists()) {
+            throw new RuntimeException('The folder is empty, but it contained videos at the last scan. If it is a network share, check that it is mounted.');
+        }
+
+        $patterns = $root->library()->firstOrFail()->exclusion_patterns;
+        $videoExtensions = config()->array('libraries.video_extensions');
         $rows = [];
         $prefixLength = strlen(rtrim($root->path, '/')) + 1;
 
         foreach ($this->files($root->path, $patterns) as $file) {
             $extension = strtolower($file->getExtension());
 
-            if (! in_array($extension, config()->array('libraries.video_extensions'), true)) {
+            if (! in_array($extension, $videoExtensions, true)) {
                 continue;
             }
 

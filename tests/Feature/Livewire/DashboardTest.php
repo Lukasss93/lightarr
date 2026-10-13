@@ -21,7 +21,7 @@ it('shows tracked metadata and calculates present bytes separately from other st
 
     actingAs(User::factory()->create())->get(route('home'))->assertOk()->assertSee('Film.mkv')->assertSee('/media/movies');
     Livewire::test(Dashboard::class)->assertViewHas('counts', ['present' => 1, 'missing' => 1, 'excluded' => 1])
-        ->assertViewHas('presentSize', '2.00 GiB');
+        ->assertViewHas('presentSize', '2 GB');
 });
 
 it('filters by filename, relative path, library, and availability', function (): void {
@@ -38,6 +38,28 @@ it('filters by filename, relative path, library, and availability', function ():
         ->set('search', '')->set('library', (string) $shows->id)->assertSee('Episode.mkv')->assertDontSee('My Film.mkv')
         ->assertViewHas('counts', ['present' => 0, 'missing' => 1, 'excluded' => 0]);
     $component->set('library', '')->set('status', 'present')->assertSee('My Film.mkv')->assertDontSee('Episode.mkv');
+});
+
+it('matches wildcard characters in searches literally and ignores letter case', function (): void {
+    $root = LibraryPath::factory()->create();
+
+    foreach (['S01_E01.mkv', 'S01xE01.mkv', '100% Pure.mkv', '1000 Pure.mkv', 'Wow!.mkv', 'Wowza.mkv'] as $path) {
+        MediaFile::factory()->for($root, 'libraryPath')->atPath($path)->create();
+    }
+
+    Livewire::test(Dashboard::class)
+        ->set('search', 'S01_E01')->assertSee('S01_E01.mkv')->assertDontSee('S01xE01.mkv')
+        ->set('search', '100%')->assertSee('100% Pure.mkv')->assertDontSee('1000 Pure.mkv')
+        ->set('search', 'Wow!')->assertSee('Wow!.mkv')->assertDontSee('Wowza.mkv')
+        ->set('search', 'pure')->assertSee('100% Pure.mkv')->assertSee('1000 Pure.mkv');
+});
+
+it('ignores library and availability filters that are not valid values', function (): void {
+    $root = LibraryPath::factory()->create();
+    MediaFile::factory()->for($root, 'libraryPath')->atPath('Movie.mkv')->create();
+
+    Livewire::withQueryParams(['library' => 'abc', 'status' => 'unknown'])->test(Dashboard::class)
+        ->assertOk()->assertSee('Movie.mkv')->assertViewHas('counts', ['present' => 1, 'missing' => 0, 'excluded' => 0]);
 });
 
 it('paginates deterministically and returns to page one when a filter changes', function (): void {

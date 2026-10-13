@@ -3,7 +3,6 @@
 use App\Jobs\ScanLibraryPath;
 use App\Models\LibraryPath;
 use App\Scan\Enums\ScanStatus;
-use App\Scan\MediaScanner;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
 use Illuminate\Support\Str;
 use Illuminate\Testing\PendingCommand;
@@ -63,10 +62,15 @@ function mediaDirectory(array $files = []): string
     return $testCase->mediaDirectory($files);
 }
 
-/** @param list<string> $patterns */
+/**
+ * Run a scan of the folder through the synchronous queue, so failures are recorded as a worker would record them.
+ *
+ * @param  list<string>  $patterns
+ */
 function scanMediaPath(LibraryPath $path, array $patterns = []): void
 {
     $token = (string) Str::uuid();
-    $path->refresh()->update(['scan_status' => ScanStatus::Queued, 'scan_token' => $token]);
-    (new ScanLibraryPath($path->id, $token, $patterns))->handle(app(MediaScanner::class));
+    $path->refresh()->update(['scan_status' => ScanStatus::Queued, 'scan_token' => $token, 'scan_requested_at' => now()]);
+    $path->library()->firstOrFail()->update(['exclusion_patterns' => $patterns]);
+    ScanLibraryPath::dispatchSync($path->id, $token);
 }

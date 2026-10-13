@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Number;
 
 /**
  * @property MediaFileStatus $status
@@ -30,7 +31,7 @@ class MediaFile extends Model
 
     public function formattedSize(): string
     {
-        return number_format($this->size_bytes / 1073741824, 2).' GiB';
+        return Number::fileSize($this->size_bytes, maxPrecision: 2);
     }
 
     /** @return array<string, string> */

@@ -5,6 +5,7 @@ namespace App\Scan\Actions;
 use App\Models\Library;
 use App\Models\LibraryPath;
 use App\Scan\LibraryPathResolver;
+use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\ValidationException;
@@ -30,42 +31,58 @@ class SaveLibrary
                 : $this->paths->canonical($path, 'paths.'.$index);
         }
 
-        $library = Cache::lock('library-path-management', 30)->block(5, function () use ($libraryId, $attributes, $canonical): Library {
-            return DB::transaction(function () use ($libraryId, $attributes, $canonical): Library {
-                $library = $libraryId === null ? new Library : Library::query()->findOrFail($libraryId);
-                $others = LibraryPath::query()
-                    ->when($libraryId !== null, fn ($query) => $query->where('library_id', '!=', $libraryId))
-                    ->pluck('path')->all();
-                $accepted = [];
+        // The lock stops two saves from adding overlapping folders at the same time.
+        try {
+            $library = Cache::lock('library-path-management', 30)->block(5, fn (): Library => DB::transaction(
+                fn (): Library => $this->persist($libraryId, $attributes, $canonical),
+            ));
+        } catch (LockTimeoutException) {
+            throw ValidationException::withMessages(['paths' => 'Another library is being saved. Try again in a moment.']);
+        }
 
-                foreach ($canonical as $index => $path) {
-                    foreach ([...$others, ...$accepted] as $existing) {
-                        if ($this->paths->overlaps($path, $existing)) {
-                            throw ValidationException::withMessages([
-                                'paths.'.$index => 'This folder duplicates or overlaps another configured folder: '.$existing,
-                            ]);
-                        }
-                    }
+        // Exclusion rules apply to every folder, so changing them rescans the whole library.
+        if ($library->wasChanged('exclusion_patterns')) {
+            $this->requestScan->handle($library);
+        } else {
+            $this->requestScan->forNewPaths($library);
+        }
 
-                    $accepted[] = $path;
+        return $library;
+    }
+
+    /**
+     * @param  array{name: string, automatic_scanning: bool, scan_interval_minutes: int, exclusion_patterns: list<string>}  $attributes
+     * @param  list<string>  $canonical
+     */
+    private function persist(?int $libraryId, array $attributes, array $canonical): Library
+    {
+        $library = $libraryId === null ? new Library : Library::query()->findOrFail($libraryId);
+        $others = LibraryPath::query()
+            ->when($libraryId !== null, fn ($query) => $query->where('library_id', '!=', $libraryId))
+            ->pluck('path')->all();
+        $accepted = [];
+
+        foreach ($canonical as $index => $path) {
+            foreach ([...$others, ...$accepted] as $existing) {
+                if ($this->paths->overlaps($path, $existing)) {
+                    throw ValidationException::withMessages([
+                        'paths.'.$index => 'This folder duplicates or overlaps another configured folder: '.$existing,
+                    ]);
                 }
+            }
 
-                $library->fill($attributes)->save();
-                $library->paths()->whereNotIn('path', $canonical)->delete();
+            $accepted[] = $path;
+        }
 
-                foreach ($canonical as $path) {
-                    $library->paths()->firstOrCreate(
-                        ['path_hash' => hash('sha256', $path)],
-                        ['path' => $path],
-                    );
-                }
+        $library->fill($attributes)->save();
+        $library->paths()->whereNotIn('path', $canonical)->delete();
 
-                return $library;
-            });
-
-        });
-
-        $this->requestScan->forNewPaths($library);
+        foreach ($canonical as $path) {
+            $library->paths()->firstOrCreate(
+                ['path_hash' => hash('sha256', $path)],
+                ['path' => $path],
+            );
+        }
 
         return $library;
     }

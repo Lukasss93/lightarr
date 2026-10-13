@@ -6,84 +6,98 @@ use App\Jobs\ScanLibraryPath;
 use App\Models\Library;
 use App\Models\LibraryPath;
 use App\Scan\Enums\ScanStatus;
-use Illuminate\Bus\UniqueLock;
 use Illuminate\Contracts\Bus\Dispatcher;
-use Illuminate\Contracts\Cache\Repository;
-use Illuminate\Support\Facades\Cache;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Throwable;
 
 class RequestLibraryScan
 {
-    public function __construct(private Dispatcher $bus, private Repository $cache) {}
+    public function __construct(private Dispatcher $bus) {}
 
-    /** @param list<int>|null $pathIds */
-    public function handle(Library $library, ?array $pathIds = null): int
+    /**
+     * Queue a scan for each folder of the library that does not already have one pending.
+     *
+     * @return int The number of folders queued.
+     */
+    public function handle(Library $library): int
     {
-        return Cache::lock('library-scan-dispatch:'.$library->id, 30)->block(5, function () use ($library, $pathIds): int {
-            return DB::transaction(function () use ($library, $pathIds): int {
-                $library = Library::query()->find($library->id);
+        $queued = $this->queueAll($library->paths()->get());
 
-                if ($library === null) {
-                    return 0;
-                }
+        if ($queued > 0) {
+            $library->update(['last_scan_requested_at' => now()]);
+        }
 
-                $paths = $library->paths()
-                    ->when($pathIds !== null, fn ($query) => $query->whereIn('id', $pathIds))
-                    ->whereNotIn('scan_status', [ScanStatus::Queued, ScanStatus::Scanning])
-                    ->get();
-
-                foreach ($paths as $path) {
-                    $token = (string) Str::uuid();
-                    $path->update([
-                        'scan_status' => ScanStatus::Queued,
-                        'scan_token' => $token,
-                        'scan_requested_at' => now(),
-                        'scan_started_at' => null,
-                        'scan_finished_at' => null,
-                        'scan_error' => null,
-                    ]);
-                    $job = new ScanLibraryPath($path->id, $token, $library->exclusion_patterns);
-
-                    DB::afterCommit(fn () => $this->enqueue($job));
-                }
-
-                if ($paths->isNotEmpty()) {
-                    $library->update(['last_scan_requested_at' => now()]);
-                }
-
-                return $paths->count();
-            });
-        });
+        return $queued;
     }
 
+    /**
+     * Queue a scan for each folder of the library that has never been scanned.
+     *
+     * This leaves the library's automatic scan timer alone, so adding a folder does not delay
+     * the next scan of the others. A library that has never been scanned starts its timer
+     * here, because all of its folders are new.
+     *
+     * @return int The number of folders queued.
+     */
     public function forNewPaths(Library $library): int
     {
-        $pathIds = array_values($library->paths()->where('scan_status', ScanStatus::Idle)->get(['id'])
-            ->map(fn (LibraryPath $path): int => $path->id)->all());
+        $queued = $this->queueAll($library->paths()->where('scan_status', ScanStatus::Idle)->get());
 
-        return $this->handle($library, $pathIds);
+        if ($queued > 0 && $library->last_scan_requested_at === null) {
+            $library->update(['last_scan_requested_at' => now()]);
+        }
+
+        return $queued;
     }
 
-    private function enqueue(ScanLibraryPath $job): void
+    /** @param Collection<int, LibraryPath> $paths */
+    private function queueAll(Collection $paths): int
     {
-        if (! LibraryPath::query()->whereKey($job->pathId)->where('scan_token', $job->token)->exists()) {
-            return;
+        return $paths->filter(fn (LibraryPath $path): bool => $this->queue($path))->count();
+    }
+
+    private function queue(LibraryPath $path): bool
+    {
+        if ($path->hasPendingScan()) {
+            return false;
         }
 
-        $lock = new UniqueLock($this->cache);
+        // A lost queued scan keeps its token, so if the original job does turn up,
+        // it and the replacement compete for the same claim and only one of them scans.
+        $token = $path->scan_status === ScanStatus::Queued && $path->scan_token !== null
+            ? $path->scan_token
+            : (string) Str::uuid();
 
-        if (! $lock->acquire($job)) {
-            $job->failed(new \RuntimeException('A scan is already finishing for this folder. Try again shortly.'));
+        // Only update the folder if no other request or job has changed it since it was read.
+        $updated = LibraryPath::query()->whereKey($path->id)
+            ->where('scan_status', $path->scan_status)
+            ->where('scan_token', $path->scan_token)
+            ->update([
+                'scan_status' => ScanStatus::Queued,
+                'scan_token' => $token,
+                'scan_requested_at' => now(),
+                'scan_started_at' => null,
+                'scan_finished_at' => null,
+                'scan_error' => null,
+            ]);
 
-            return;
+        if ($updated === 0) {
+            return false;
         }
 
+        $job = new ScanLibraryPath($path->id, $token);
+        DB::afterCommit(fn () => $this->dispatch($job));
+
+        return true;
+    }
+
+    private function dispatch(ScanLibraryPath $job): void
+    {
         try {
             $this->bus->dispatch($job);
         } catch (Throwable $exception) {
-            $lock->release($job);
             $job->failed($exception);
             report($exception);
         }
