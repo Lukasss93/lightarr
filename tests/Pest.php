@@ -1,8 +1,13 @@
 <?php
 
+use App\Jobs\ScanLibraryPath;
+use App\Models\LibraryPath;
+use App\Scan\Enums\ScanStatus;
 use Illuminate\Foundation\Testing\LazilyRefreshDatabase;
+use Illuminate\Support\Str;
 use Illuminate\Testing\PendingCommand;
 use Illuminate\Testing\TestResponse;
+use Pest\TestSuite;
 use Symfony\Component\HttpFoundation\Response;
 use Tests\TestCase;
 
@@ -41,4 +46,31 @@ function livewireUpdatePayload(TestResponse $response, array $updates = [], arra
             'calls' => $calls,
         ]],
     ];
+}
+
+/**
+ * @param  array<string, string>  $files
+ */
+function mediaDirectory(array $files = []): string
+{
+    $testCase = TestSuite::getInstance()->test;
+
+    if (! $testCase instanceof TestCase) {
+        throw new LogicException('Media fixtures require a Laravel test case.');
+    }
+
+    return $testCase->mediaDirectory($files);
+}
+
+/**
+ * Run a scan of the folder through the synchronous queue, so failures are recorded as a worker would record them.
+ *
+ * @param  list<string>  $patterns
+ */
+function scanMediaPath(LibraryPath $path, array $patterns = []): void
+{
+    $token = (string) Str::uuid();
+    $path->refresh()->update(['scan_status' => ScanStatus::Queued, 'scan_token' => $token, 'scan_requested_at' => now()]);
+    $path->library()->firstOrFail()->update(['exclusion_patterns' => $patterns]);
+    ScanLibraryPath::dispatchSync($path->id, $token);
 }
